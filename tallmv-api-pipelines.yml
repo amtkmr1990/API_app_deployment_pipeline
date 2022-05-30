@@ -1,0 +1,194 @@
+# ASP.NET Core (.NET Framework)
+# Build and test ASP.NET Core projects targeting the full .NET Framework.
+# Add steps that publish symbols, save build artifacts, and more:
+# https://docs.microsoft.com/azure/devops/pipelines/languages/dotnet-core
+
+trigger:
+  branches:
+    include:
+    - main
+  paths:
+    exclude:
+    - 'tallmv-api-pipelines.yml'
+    - 'apim_api_deploy.ps1'
+    - 'apim-deploy-pipelines.yml'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  solution: '**/*.sln'
+  buildPlatform: 'Any CPU'
+  buildConfiguration: 'Release'
+
+stages:
+  - stage: Build_Stage
+    displayName: Build Stage 
+
+    jobs:
+      - job: ApiBuild
+        displayName: Api Build 
+
+        steps:
+        - task: UseDotNet@2
+          inputs:
+            packageType: 'sdk'
+            version: '5.0.x'
+        - task: DotNetCoreCLI@2
+          displayName: Restore
+          inputs:
+            command: restore
+            projects: '**/GPU.TALLMV.API/GPU.TALLMV.API.csproj'
+        - task: DotNetCoreCLI@2
+          displayName: Build
+          inputs:
+            projects: '**/GPU.TALLMV.API/GPU.TALLMV.API.csproj'
+            arguments: '--configuration $(BuildConfiguration)'  
+
+        - task: DotNetCoreCLI@2
+          displayName: Publish
+          inputs:
+            command: publish
+            publishWebProjects: false
+            projects: '**/GPU.TALLMV.API/GPU.TALLMV.API.csproj'
+            arguments: '--configuration $(BuildConfiguration) --output $(build.artifactstagingdirectory)/ci-build --no-build'
+            zipAfterPublish: false
+            modifyOutputPath: false  
+
+        # - script: | 
+        #     cd $(build.artifactstagingdirectory)/ci-build
+        #     dotnet new tool-manifest
+        #   displayName: 'Create Tool Manifest'
+
+        # - script: |
+        #     cd $(build.artifactstagingdirectory)/ci-build
+        #     dotnet tool install --version 6.2.2 Swashbuckle.AspNetCore.Cli
+        #   displayName: 'Install Swashbuckle CLI'
+    
+        # - script: |
+        #     echo 'content of ci-build'           
+        #     ls $(build.artifactstagingdirectory)/ci-build
+        #     cd $(build.artifactstagingdirectory)/ci-build
+        #     dotnet tool run swagger tofile --output $(build.artifactstagingdirectory)/ci-build/swagger.json GPU.TALLMV.API.dll v1
+        #   displayName: 'Generate Swagger'
+
+        - task: ArchiveFiles@2
+          displayName: 'Archive $(Build.StagingDirectory)/ci-build'
+          inputs:
+            rootFolderOrFile: '$(Build.StagingDirectory)/ci-build'
+            includeRootFolder: false
+            archiveFile: '$(Build.ArtifactStagingDirectory)/TallmvApi-$(Build.BuildNumber).zip'
+          
+        - task: PublishBuildArtifacts@1
+          displayName: 'Publish Artifact'
+          inputs:
+            PathtoPublish: '$(Build.ArtifactStagingDirectory)/TallmvApi-$(Build.BuildNumber).zip'
+          condition: succeededOrFailed()
+  
+  - stage: Dev
+    displayName: API Deploy to Dev
+    pool: 'LYB Internal Agent Pool'
+    variables:
+    - group: TALLMV.API
+    - name: ASPNETCORE_ENVIRONMENT
+      value: 'Development'
+    - name: KeyVault
+      value: 'kv-tallmv-dev'
+    - name: WebAppName
+      value: 'as-turnaroundllmvapi-dev'
+    jobs:
+      - deployment: Deploy 
+        workspace:
+          clean: all # what to clean up before the job runs
+        environment: TALLMV_API_DEV
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              # - task: DownloadPipelineArtifact@2
+              #   inputs:
+              #     buildType: 'current'
+              #     artifactName: 'drop'
+              #     targetPath: '$(System.ArtifactsDirectory)'
+
+              - task: AzureRmWebAppDeployment@4
+                displayName: 'Deploy Azure App Service'
+                inputs:
+                  ConnectionType: 'AzureRM'
+                  azureSubscription: 'lyb-gpu-nonprd'
+                  appType: 'webAppLinux'
+                  WebAppName: '$(WebAppName)'
+                  packageForLinux: '$(Agent.BuildDirectory)/**/*.zip'
+                  AppSettings: '-ASPNETCORE_ENVIRONMENT "$(ASPNETCORE_ENVIRONMENT)" -DBSchemaName "$(DBSchemaName)" -KeyVault "$(KeyVault)" -BlobStoragName "$(BlobStoragName)" -EmailLogicApp "$(EmailLogicApp)" '
+  
+
+  - stage: APIM_DEV
+    displayName: APIM_DEV
+    pool: 'LYB Internal Agent Pool'
+    variables:
+    - name: swaggerSourceUrl
+      value: 'https://as-turnaroundllmvapi-dev.azurewebsites.net/swagger/v1/swagger.json'
+    - name: APIMResourceGroup
+      value: 'rg-apiplatform-nonprd'
+    - name: APIMName
+      value: 'apim-apiplatform-nonprd'
+    - name: backEndUrl
+      value: 'https://as-turnaroundllmvapi-dev.azurewebsites.net'
+    - name: swaggerTitle
+      value: 'TALLMV-DEV'
+    - name: uIUrl
+      value: 'https://gputallmv-dev.lyondellbasell.com'
+    - name: ApiId
+      value: 'tallmv-dev'
+    - name: APIURLSuffix
+      value: 'external/tallmv-dev'
+    
+    jobs:
+    - job: APIM_API_Deploy
+      steps:
+        - task: AzurePowerShell@5
+          inputs:
+            azureSubscription: 'lyb-nonprd'
+            ScriptType: 'FilePath'
+            ScriptPath: 'apim_api_deploy.ps1'
+            ScriptArguments: '-swaggerSourceUrl $(swaggerSourceUrl) -APIMResourceGroup $(APIMResourceGroup) -APIMName $(APIMName) -backEndUrl $(backEndUrl) -swaggerTitle $(swaggerTitle) -uIUrl $(uIUrl) -ApiId $(ApiId) -APIURLSuffix $(APIURLSuffix)'
+            FailOnStandardError: true
+            azurePowerShellVersion: 'LatestVersion'
+  
+  
+  - stage: Stg
+    displayName: API Deploy to Stg
+    pool: 'LYB Internal Agent Pool'
+    variables:
+    - group: TALLMV.API
+    - name: ASPNETCORE_ENVIRONMENT
+      value: 'Staging'
+    - name: KeyVault
+      value: 'kv-tallmv-stg'
+    - name: WebAppName
+      value: 'as-turnaroundllmvapi-stg'
+    jobs:
+      - deployment: Deploy 
+        workspace:
+          clean: all # what to clean up before the job runs
+        environment: TALLMV_API_STG
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              # - task: DownloadPipelineArtifact@2
+              #   inputs:
+              #     buildType: 'current'
+              #     artifactName: 'drop'
+              #     targetPath: '$(System.ArtifactsDirectory)'
+
+              - task: AzureRmWebAppDeployment@4
+                displayName: 'Deploy Azure App Service'
+                inputs:
+                  ConnectionType: 'AzureRM'
+                  azureSubscription: 'lyb-gpu-nonprd'
+                  appType: 'webAppLinux'
+                  WebAppName: '$(WebAppName)'
+                  packageForLinux: '$(Agent.BuildDirectory)/**/*.zip'
+                  AppSettings: '-ASPNETCORE_ENVIRONMENT "$(ASPNETCORE_ENVIRONMENT)" -DBSchemaName "$(DBSchemaName)" -KeyVault "$(KeyVault)" -BlobStoragName "$(BlobStoragName)" -EmailLogicApp "$(EmailLogicApp)" '
+  
